@@ -12,6 +12,15 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 <!-- changelog -->
 
+## v1.2.8 (2026-09-07)
+
+
+
+
+### Bug Fixes:
+
+* strip terminal control sequences from hex docs search results by Zach Daniel
+
 ## v1.2.7 (2026-07-26)
 
 
