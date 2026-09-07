@@ -260,6 +260,16 @@ defmodule Mix.Tasks.UsageRules.SearchDocs do
       "highlights" => highlights
     } = hit
 
+    # Every field here is publisher-controlled documentation metadata indexed by
+    # search.hexdocs.pm and printed straight to the terminal. Strip control
+    # characters so a package cannot inject terminal escape sequences (forged
+    # output, hidden text, OSC 52 clipboard writes). This runs before the
+    # <mark> -> ANSI conversion so the highlighting we add intentionally is kept.
+    title = terminal_safe(title)
+    package = terminal_safe(package)
+    type = terminal_safe(type)
+    ref = terminal_safe(ref)
+
     # Calculate global result number
     global_index = (current_page - 1) * per_page + index
 
@@ -281,8 +291,8 @@ defmodule Mix.Tasks.UsageRules.SearchDocs do
       # Limit to 2 highlights to avoid clutter
       |> Enum.take(2)
       |> Enum.map_join("\n\n", fn highlight ->
-        snippet = highlight["snippet"]
-        field = highlight["field"]
+        snippet = terminal_safe(highlight["snippet"])
+        field = terminal_safe(highlight["field"])
 
         # Convert <mark> tags to ANSI orange highlighting for TTY
         snippet_display = if tty?(), do: convert_mark_tags_to_ansi(snippet), else: snippet
@@ -308,6 +318,13 @@ defmodule Mix.Tasks.UsageRules.SearchDocs do
 
     result <> highlights_text <> footer
   end
+
+  # Removes control characters (C0/C1, incl. ESC, CR and BEL) from a
+  # publisher-controlled string so it cannot inject terminal escape sequences.
+  defp terminal_safe(string) when is_binary(string),
+    do: String.replace(string, ~r/\p{Cc}/u, "")
+
+  defp terminal_safe(other), do: other
 
   defp convert_mark_tags_to_ansi(text) do
     text
