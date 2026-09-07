@@ -19,7 +19,7 @@ See [Conventional Commits](Https://conventionalcommits.org) for commit guideline
 
 ### Bug Fixes:
 
-* strip terminal control sequences from hex docs search results by Zach Daniel
+* strip terminal control sequences from hex docs search results (CVE-2026-82710) by Zach Daniel
 
 ## v1.2.7 (2026-07-26)
 
