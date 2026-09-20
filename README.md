@@ -378,6 +378,26 @@ mix usage_rules.search_docs "search term" --query-by title
 mix usage_rules.search_docs "search term" --page 2 --per-page 20
 ```
 
+## Reference Validation
+
+`mix usage_rules.validate` checks the files managed by `mix usage_rules.sync` for broken references: `Module`, `Module.function/arity`, and `:erlang.module/arity` references are verified against your project and its dependencies, `mix task.name` references are verified against real tasks (and aliases), and relative markdown links are checked for existence. Exit status is nonzero when violations are found, so it can be used in CI.
+
+```sh
+# Validate rules-managed files (the composed file and managed skills)
+mix usage_rules.validate
+
+# Treat warnings as failures too
+mix usage_rules.validate --strict
+
+# Validate every markdown file in the project
+mix usage_rules.validate --all
+
+# Machine-readable output
+mix usage_rules.validate --format json
+```
+
+By default, only rules-managed files are validated: the composed file from the `:file` config option, and `*.md` files under skills whose `SKILL.md` contains `managed-by: usage-rules`.
+
 ## For Package Authors
 
 Even if you don't use LLMs yourself, your users likely do. Writing a `usage-rules.md` file helps prevent hallucination-driven support requests.
