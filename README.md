@@ -380,7 +380,7 @@ mix usage_rules.search_docs "search term" --page 2 --per-page 20
 
 ## Reference Validation
 
-`mix usage_rules.validate` checks the files managed by `mix usage_rules.sync` for broken references: `Module`, `Module.function/arity`, and `:erlang.module/arity` references are verified against your project and its dependencies, `mix task.name` references are verified against real tasks (and aliases), and relative markdown links are checked for existence. Exit status is nonzero when violations are found, so it can be used in CI.
+`mix usage_rules.validate` checks the files managed by `mix usage_rules.sync` for broken references. Reference parsing and resolution are delegated to `ex_doc` — the same engine that autolinks (and verifies) references when building HexDocs — so `Module`, `Module.function/arity`, `m:Module`, `c:Mod.callback/arity`, `t:Mod.type/arity`, and `:erlang.module/arity` references are verified against your project and its dependencies exactly the way a docs build resolves them (only *documented* API validates), mix task references are verified against real tasks, and relative markdown links are checked for existence. ex_doc must be compiled (it is already a dev dependency of most Hex packages); the task fails with an actionable error when it is not. Exit status is nonzero when violations are found, so it can be used in CI.
 
 ```sh
 # Validate rules-managed files (the composed file and managed skills)

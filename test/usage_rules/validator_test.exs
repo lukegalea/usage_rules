@@ -15,9 +15,11 @@ defmodule UsageRules.ValidatorTest do
       "NoSuchModuleAnywhere",
       "Enum.definitely_not_real/2",
       "Enum.map/9",
+      "GenServer.handle_call/3",
       ":timer.definitely_not_real/1",
       ":no_such_erlang_module.foo/1",
       "mix definitely_not_a_real_task",
+      "Mix.Tasks.UsageRules.Sync.Docs",
       "missing.md",
       "Flagged.In.Fence"
     ]
@@ -56,19 +58,28 @@ defmodule UsageRules.ValidatorTest do
             "Mix.Tasks.UsageRules.List",
             "UsageRules.Validator",
             "String.upcase/1",
-            "GenServer.handle_call/3",
+            "c:GenServer.handle_call/3",
             ":timer.tc/3",
             "mix usage_rules.docs",
             "mix usage_rules.list",
             "mix usage_rules.search_docs",
+            "mix usage_rules.list --help",
             "exists.md"
           ] do
         refute valid in reported, "did not expect #{valid} to be reported"
       end
 
-      # File names in code spans and strings/comments must not be treated
-      # as module references.
-      for false_positive <- ["AGENTS.md", "SKILL.md", "mix.exs", "Skipped.Module", "hello"] do
+      # File names, bare atoms, and lowercase function mentions in code spans
+      # and fences must not be treated as module references.
+      for false_positive <- [
+            "AGENTS.md",
+            "SKILL.md",
+            "mix.exs",
+            ":ok",
+            "hello",
+            "Skipped.Module",
+            "Inside.String.Ignored"
+          ] do
         refute false_positive in reported
       end
 
@@ -92,7 +103,7 @@ defmodule UsageRules.ValidatorTest do
                } = violation
 
         assert is_integer(line) and line > 0
-        assert type in [:module, :function, :mix_task, :link]
+        assert type in [:module, :function, :callback, :type, :mix_task, :link]
         assert severity in ["error", "warning"]
         assert is_binary(reference) and reference != ""
         assert is_binary(message) and message != ""
@@ -107,18 +118,22 @@ defmodule UsageRules.ValidatorTest do
       assert by_ref["NoSuch.Module.Xyz"] == :module
       assert by_ref["Enum.definitely_not_real/2"] == :function
       assert by_ref["Enum.map/9"] == :function
+      assert by_ref["GenServer.handle_call/3"] == :function
+      assert by_ref["Mix.Tasks.UsageRules.Sync.Docs"] == :module
       assert by_ref["mix definitely_not_a_real_task"] == :mix_task
       assert by_ref["missing.md"] == :link
     end
 
-    test "mentions available arities on arity mismatches", %{context: context} do
+    test "uses ex_doc's own messages on violations", %{context: context} do
       violations = hd(UsageRules.Validator.validate([@fixture_path], context).files).violations
 
-      Enum.each(violations, fn violation ->
-        if violation.reference == "Enum.map/9" do
-          assert violation.message =~ "available arities"
-        end
-      end)
+      by_ref = Map.new(violations, fn v -> {v.reference, v.message} end)
+
+      assert by_ref["Enum.map/9"] =~ "documentation references function"
+      assert by_ref["Enum.map/9"] =~ "undefined or private"
+      assert by_ref["NoSuch.Module.Xyz"] =~ "documentation references module"
+      assert by_ref["Mix.Tasks.UsageRules.Sync.Docs"] =~ "hidden"
+      assert by_ref["mix definitely_not_a_real_task"] =~ "documentation references"
     end
 
     test "deduplicates identical references on the same line", %{context: context} do
@@ -128,6 +143,26 @@ defmodule UsageRules.ValidatorTest do
 
       assert hd(report.files).violations |> Enum.count(&(&1.reference == "NoSuch.Module.Xyz")) ==
                1
+    end
+  end
+
+  describe "ensure_ex_doc!/1" do
+    test "passes when ex_doc is compiled and started" do
+      assert :ok = UsageRules.Validator.ensure_ex_doc!()
+    end
+
+    test "fails with an actionable error when ex_doc is not compiled" do
+      exception =
+        assert_raise Mix.Error, fn ->
+          UsageRules.Validator.ensure_ex_doc!(fn _ -> {:error, :nofile} end)
+        end
+
+      message = Exception.message(exception)
+
+      assert message =~ "ex_doc"
+      assert message =~ "not compiled and available"
+      assert message =~ "mix deps.get"
+      assert message =~ "mix deps.compile"
     end
   end
 
@@ -141,46 +176,71 @@ defmodule UsageRules.ValidatorTest do
       assert Enum.map(violations, & &1.reference) == ["NoSuch.Module.Xyz"]
       assert hd(report.files).references_checked == 2
     end
+
+    test "reports the line number of the code span", %{context: context} do
+      content = """
+      first line
+      second line
+      broken: `NoSuch.Module.Xyz`
+      """
+
+      report = UsageRules.Validator.validate([{"m.md", content}], context)
+
+      assert hd(report.files).violations |> hd() |> Map.fetch!(:line) == 3
+    end
   end
 
-  describe "module resolution" do
-    test "flags modules missing from both beams and sources", %{context: context} do
-      report = UsageRules.Validator.validate([{"m.md", "`Definitely.Not.A.Module`"}], context)
-      violations = hd(report.files).violations
+  describe "ex_doc reference semantics" do
+    test "accepts documented modules, functions, and callbacks", %{context: context} do
+      content = """
+      `Enum` and `String.upcase/1` and `c:GenServer.handle_call/3` and `m:Enum` and `t:Calendar.date/0`
+      """
 
-      assert [%{type: :module, severity: "error"}] = violations
-    end
-
-    test "accepts modules that only exist as uncompiled sources" do
-      context = %{
-        UsageRules.Validator.context_from_mix()
-        | source_module_names: MapSet.put(MapSet.new(), "Fake.Source.Only")
-      }
-
-      report = UsageRules.Validator.validate([{"m.md", "`Fake.Source.Only`"}], context)
+      report = UsageRules.Validator.validate([{"m.md", content}], context)
 
       assert hd(report.files).violations == []
     end
 
-    test "downgrades function checks on uncompiled modules to warnings" do
-      context = %{
-        UsageRules.Validator.context_from_mix()
-        | source_module_names: MapSet.put(MapSet.new(), "Fake.Source.Only")
-      }
+    test "flags callbacks referenced without the c: prefix", %{context: context} do
+      report = UsageRules.Validator.validate([{"m.md", "`GenServer.handle_call/3`"}], context)
 
-      report =
-        UsageRules.Validator.validate([{"m.md", "`Fake.Source.Only.do_thing/1`"}], context)
+      assert [%{type: :function, severity: "error", message: message}] =
+               hd(report.files).violations
 
-      assert [%{severity: "warning", type: :function}] = hd(report.files).violations
+      assert message =~ "undefined or private"
     end
 
-    test "reports erlang module refs only through :module.function form" do
-      context = UsageRules.Validator.context_from_mix()
+    test "flags undocumented (@moduledoc false / @doc false) targets", %{context: context} do
+      content = "`Mix.Tasks.UsageRules.Sync.Docs` and `Mix.Tasks.UsageRules.Install.Docs`"
 
+      report = UsageRules.Validator.validate([{"m.md", content}], context)
+      violations = hd(report.files).violations
+
+      assert length(violations) == 2
+      assert Enum.all?(violations, &(&1.message =~ "hidden"))
+    end
+
+    test "reports erlang module refs only through :module.function/arity form", %{
+      context: context
+    } do
       content = "Atoms are fine: `:ok`, `:error`, but `:ets.insert/2` must exist.\n"
       report = UsageRules.Validator.validate([{"m.md", content}], context)
 
       assert hd(report.files).violations == []
+    end
+
+    test "validates mix task references with flags, validating only the task", %{context: context} do
+      content = "Run `mix usage_rules.validate --format json` first.\n"
+      report = UsageRules.Validator.validate([{"m.md", content}], context)
+
+      assert hd(report.files).violations == []
+    end
+
+    test "flags unknown mix tasks", %{context: context} do
+      report =
+        UsageRules.Validator.validate([{"m.md", "`mix definitely_not_a_real_task`"}], context)
+
+      assert [%{type: :mix_task, severity: "error"}] = hd(report.files).violations
     end
   end
 
@@ -254,6 +314,21 @@ defmodule UsageRules.ValidatorTest do
 
       assert refs == ["Fence.Bad.Module"]
     end
+
+    test "records exact line numbers inside fences", %{context: context} do
+      content = """
+      ```elixir
+      Enum.map/2 ok
+      Flagged.In.Fence
+      ```
+      """
+
+      report = UsageRules.Validator.validate([{"m.md", content}], context)
+      violation = hd(report.files).violations |> hd()
+
+      assert violation.reference == "Flagged.In.Fence"
+      assert violation.line == 3
+    end
   end
 
   describe "link handling" do
@@ -293,24 +368,11 @@ defmodule UsageRules.ValidatorTest do
       assert UsageRules.Validator.failed?(report)
     end
 
-    test "returns false for warnings unless strict", %{context: context} do
+    test "returns false for clean reports", %{context: context} do
       report = UsageRules.Validator.validate([{"m.md", "just prose"}], context)
 
       refute UsageRules.Validator.failed?(report)
       refute UsageRules.Validator.failed?(report, strict?: true)
-    end
-
-    test "strict mode fails on warnings" do
-      context = %{
-        UsageRules.Validator.context_from_mix()
-        | source_module_names: MapSet.put(MapSet.new(), "Fake.Source.Only")
-      }
-
-      report =
-        UsageRules.Validator.validate([{"m.md", "`Fake.Source.Only.do_thing/1`"}], context)
-
-      refute UsageRules.Validator.failed?(report)
-      assert UsageRules.Validator.failed?(report, strict?: true)
     end
   end
 
@@ -352,7 +414,7 @@ defmodule UsageRules.ValidatorTest do
                  MapSet.new(~w(line type severity reference message))
                )
 
-        assert violation["type"] in ["module", "function", "mix_task", "link"]
+        assert violation["type"] in ["module", "function", "callback", "type", "mix_task", "link"]
         assert violation["severity"] in ["error", "warning"]
       end)
     end

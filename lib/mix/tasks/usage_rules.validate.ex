@@ -11,10 +11,18 @@ defmodule Mix.Tasks.UsageRules.Validate do
   Validates module, function, mix task, and file references found in the
   files generated and managed by `mix usage_rules.sync`.
 
-  Checks that `Module`, `Module.function/arity`, and `:erlang.module/arity`
-  references resolve against your project and its dependencies, that
-  `mix task.name` references are real tasks (or aliases), and that relative
-  markdown links point at files that exist.
+  References are parsed and resolved with `ex_doc` — the same engine that
+  autolinks references (and warns about broken ones) when generating HexDocs
+  documentation. Checks that `Module`, `Module.function/arity`, `m:Module`,
+  `c:Mod.callback/arity`, `t:Mod.type/arity`, and `:erlang.module/arity`
+  references resolve against your project and its dependencies the same way
+  a docs build resolves them (only *documented* API validates), that
+  `mix task.name` references are real tasks, and that relative markdown
+  links point at files that exist.
+
+  ex_doc must be compiled and available. It is already a dev dependency of
+  most Hex packages; when it is missing, the task fails with an actionable
+  error telling you how to add it.
 
   ## Scope
 
@@ -38,9 +46,7 @@ defmodule Mix.Tasks.UsageRules.Validate do
   ## Options
 
     * `--format` - `human` (default) or `json`
-    * `--strict` - treat warnings as failures. Warnings are emitted when a
-      reference cannot be fully verified, e.g. a function reference to a
-      module that exists only as an uncompiled source file.
+    * `--strict` - treat warnings as failures
     * `--all` - validate all markdown files in the project, not just
       rules-managed files
     * `--help` - show this usage information

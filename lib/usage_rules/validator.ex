@@ -4,7 +4,7 @@
 
 defmodule UsageRules.Validator do
   @moduledoc """
-  Validates module, function, mix task, and file references found in
+  Validates documentation references and file links found in
   usage-rules-managed markdown files.
 
   This is the engine behind `mix usage_rules.validate`, and can also be used
@@ -16,25 +16,35 @@ defmodule UsageRules.Validator do
       UsageRules.Validator.format_report(report)
       report.summary.errors
 
-  ## Validated reference kinds
+  ## Reference resolution is delegated to ex_doc
 
-    * `Module`, `Module.function`, and `Module.function/arity` patterns, found
-      in inline code spans and `elixir`/`iex` fenced code blocks. Verified
-      against the project's compiled beams and a static scan of `lib/` sources
-      (including umbrella apps and dependencies).
-    * `:erlang_module.function/arity` patterns in the same places. Bare
+  References are parsed and resolved with `ex_doc` — the same engine that
+  autolinks references (and warns about broken ones) when generating HexDocs
+  documentation. A reference counts as valid only when ex_doc can resolve it
+  against the modules compiled in the project, its dependencies, and
+  Erlang/OTP, honoring docs metadata (`@doc`, `@moduledoc`) exactly like a
+  docs build does:
+
+    * `Module`, `Module.function/arity`, `m:Module`, `c:Mod.callback/arity`,
+      and `t:Mod.type/arity` references, found in inline code spans and in
+      `elixir`/`iex` fenced code blocks
+    * `:erlang_module.function/arity` references in the same places. Bare
       `:atoms` are never treated as module references, since they are usually
       plain atom literals.
-    * `mix task.name` patterns, found in inline code spans and shell or
-      untagged fenced code blocks. Verified against mix tasks shipped by the
-      project and its dependencies, as well as project aliases.
+    * `mix task.name` references, found in inline code spans (including
+      command lines such as `mix task --flag`) and in shell or untagged
+      fenced code blocks. Verified against mix tasks shipped by the project
+      and its dependencies.
     * Relative markdown link targets, resolved against the directory of the
       file containing the link.
 
-  Function references are verified against module exports, macros, and
-  behaviour callbacks (so `GenServer.handle_call/3` validates correctly).
-  References to modules that exist only as uncompiled sources cannot have
-  their functions verified; those produce warnings rather than errors.
+  Because references are resolved like documentation references, only
+  *documented* API validates: targets marked `@doc false` or
+  `@moduledoc false` are reported as invalid, and behaviour callbacks must
+  use the `c:` prefix, matching ex_doc's own warnings.
+
+  ex_doc must be compiled and available. When it is not, validation fails
+  with an actionable error (see `ensure_ex_doc!/1`).
 
   Violations are reported with the file, line number, reference, message, and
   a severity of `"error"` or `"warning"`.
@@ -44,50 +54,76 @@ defmodule UsageRules.Validator do
   @elixir_langs MapSet.new(["elixir", "iex"])
   @excluded_all_dirs MapSet.new(["deps", "_build", "doc", "cover", "node_modules"])
 
-  # Capitalized file names that appear in code spans (e.g. `AGENTS.md`) must
-  # not be mistaken for `Module.function` references. Only all-caps document
-  # basenames are treated as file names, since real Elixir modules are never
-  # fully uppercase (this also keeps functions like `Enum.map/2` and
-  # `Phoenix.Component.html/1` validatable).
+  # All-caps document basenames that appear as candidates (e.g. `README`,
+  # `SKILL`) are file mentions, not module references.
   @doc_file_names MapSet.new(~w(
     README CHANGELOG LICENSE AGENTS SKILL CONTRIBUTING NOTICE TODO FAQ
     CODEOWNERS AUTHORS VERSION
   ))
 
-  # Extensions checked for the document basenames above.
-  @file_extensions MapSet.new(~w(
-    md ex exs eex heex leex txt json yaml yml lock toml ini cfg conf env license
-  ))
-
-  @candidate_regex ~r/:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*(?:\/\d+)?|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*[!?]?(?:\/\d+)?/
-  @defmodule_regex ~r/^\s*defmodule\s+((?:[A-Z][A-Za-z0-9_]*)(?:\.[A-Z][A-Za-z0-9_]*)*)/m
   @fence_regex ~r/^\s{0,3}(`{3,}|~{3,})\s*(.*)$/
-  @inline_span_regex ~r/`([^`\n]+)`/
-  @link_regex ~r/\[[^\]\n]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/
-  @mix_task_regex ~r/\bmix\s+([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)/
+  @candidate_regex ~r/:[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*(?:\/\d+)?|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*[!?]?(?:\/\d+)?/
   @double_quoted_regex ~r/"(?:\\.|[^"\\])*"/
   @comment_regex ~r/#.*/
   @url_regex ~r|https?://\S+|
-  @mix_task_module_prefix "Mix.Tasks."
+  @link_regex ~r/\[[^\]\n]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/
+  @mix_task_regex ~r/\bmix\s+([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)/
+  @module_like_regex ~r/^[A-Z][A-Za-z0-9_]*$/
 
   @doc """
   Builds a validation context from the current mix project.
-
-  Collects module names from compiled beams (the project, its dependencies,
-  and everything on the code path) and from a static scan of `lib/` sources,
-  plus mix task names and project aliases.
   """
   @spec context_from_mix() :: map()
   def context_from_mix do
-    beam_names = beam_module_names()
-    source_names = source_module_names()
+    %{cwd: File.cwd!(), apps: project_apps()}
+  end
 
-    %{
-      cwd: File.cwd!(),
-      beam_module_names: beam_names,
-      source_module_names: source_names,
-      mix_task_names: mix_task_names(beam_names, source_names)
-    }
+  @doc """
+  Ensures the ex_doc reference machinery is compiled and running, or fails
+  with an actionable error.
+
+  `validate/2` resolves references with ex_doc, so it must be compiled and
+  available. ex_doc is already a dev dependency of most Hex packages; when it
+  is missing, add it to your `mix.exs` and compile it.
+
+  The loader (defaults to `Code.ensure_loaded/1`) is injectable so tests can
+  exercise the failure path.
+  """
+  @spec ensure_ex_doc!((module() -> {:module, module()} | {:error, term()})) :: :ok
+  def ensure_ex_doc!(loader \\ &Code.ensure_loaded/1) do
+    with {:module, _} <- loader.(ExDoc.Autolink),
+         {:module, _} <- loader.(ExDoc.Refs),
+         true <- markdown_processor_available?(),
+         {:ok, _} <- Application.ensure_all_started(:ex_doc) do
+      :ok
+    else
+      false ->
+        Mix.raise(ex_doc_unavailable_message(:earmark_parser_unavailable))
+
+      {:error, reason} ->
+        Mix.raise(ex_doc_unavailable_message(reason))
+    end
+  end
+
+  @doc false
+  def ex_doc_unavailable_message(reason) do
+    """
+    reference validation requires ex_doc, but it is not compiled and available \
+    (reason: #{inspect(reason)}).
+
+    ex_doc provides the reference resolution engine used to validate
+    documentation references. Most Hex packages already depend on it as a dev
+    dependency; make sure it is declared in your mix.exs and compiled:
+
+        defp deps do
+          [
+            {:ex_doc, "~> 0.37", only: [:dev, :test], runtime: false}
+          ]
+        end
+
+        $ mix deps.get && mix deps.compile
+    """
+    |> String.trim_trailing()
   end
 
   @doc """
@@ -103,6 +139,8 @@ defmodule UsageRules.Validator do
   """
   @spec validate([Path.t() | {Path.t(), String.t()}], map()) :: map()
   def validate(files, context) when is_list(files) and is_map(context) do
+    ensure_ex_doc!()
+
     file_reports =
       files
       |> Enum.map(&normalize_file/1)
@@ -193,120 +231,18 @@ defmodule UsageRules.Validator do
   # Context building
   # -------------------------------------------------------------------
 
-  defp beam_module_names do
-    (compile_path_beams() ++ dep_ebin_beams() ++ code_path_names())
-    |> MapSet.new(&normalize_module_name/1)
-  end
-
-  defp compile_path_beams do
+  defp project_apps do
     case Mix.Project.get() do
       nil ->
         []
 
       _project ->
-        Mix.Project.compile_path()
-        |> Path.join("*.beam")
-        |> Path.wildcard()
-        |> Enum.map(&beam_name/1)
+        umbrella_apps = Map.keys(Mix.Project.apps_paths() || %{})
+
+        ([Mix.Project.config()[:app]] ++ umbrella_apps)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
     end
-  end
-
-  defp dep_ebin_beams do
-    case Mix.Project.get() do
-      nil ->
-        []
-
-      _project ->
-        build_path = Mix.Project.build_path()
-
-        Mix.Project.deps_paths()
-        |> Enum.flat_map(fn {app, path} ->
-          [
-            Path.join([build_path, "lib", to_string(app), "ebin", "*.beam"]),
-            Path.join([path, "ebin", "*.beam"])
-          ]
-        end)
-        |> Enum.flat_map(&Path.wildcard/1)
-        |> Enum.map(&beam_name/1)
-    end
-  end
-
-  defp beam_name(beam_path) do
-    beam_path |> Path.basename() |> Path.rootname()
-  end
-
-  defp code_path_names do
-    :code.all_available()
-    |> Enum.map(fn {name, _path, _loaded} -> to_string(name) end)
-  end
-
-  defp normalize_module_name("Elixir." <> rest), do: rest
-  defp normalize_module_name(name), do: name
-
-  defp source_module_names do
-    source_dirs()
-    |> Enum.flat_map(&Path.wildcard(Path.join(&1, "**/*.ex")))
-    |> Enum.flat_map(fn file ->
-      file
-      |> File.read!()
-      |> String.split("\n")
-      |> Enum.map(&Regex.run(@defmodule_regex, &1, capture: :all_but_first))
-      |> Enum.filter(& &1)
-      |> Enum.map(&hd/1)
-    end)
-    |> MapSet.new()
-  end
-
-  defp source_dirs do
-    dep_libs =
-      case Mix.Project.get() do
-        nil ->
-          []
-
-        _project ->
-          Enum.map(Mix.Project.deps_paths(), fn {_app, path} -> Path.join(path, "lib") end)
-      end
-
-    umbrella_libs =
-      (Mix.Project.apps_paths() || %{})
-      |> Map.values()
-      |> Enum.map(&Path.join(&1, "lib"))
-
-    (["lib"] ++ umbrella_libs ++ dep_libs)
-    |> Enum.filter(&File.dir?/1)
-  end
-
-  defp mix_task_names(beam_names, source_names) do
-    task_from_module = fn name ->
-      name
-      |> String.trim_leading(@mix_task_module_prefix)
-      |> String.split(".")
-      |> Enum.map_join(".", &Macro.underscore/1)
-    end
-
-    from_beams =
-      beam_names
-      |> Enum.filter(&String.starts_with?(&1, @mix_task_module_prefix))
-      |> Enum.map(task_from_module)
-
-    from_sources =
-      source_names
-      |> Enum.filter(&String.starts_with?(&1, @mix_task_module_prefix))
-      |> Enum.map(task_from_module)
-
-    aliases =
-      case Mix.Project.get() do
-        nil ->
-          []
-
-        _project ->
-          Mix.Project.config()
-          |> Keyword.get(:aliases, [])
-          |> Keyword.keys()
-          |> Enum.map(&to_string/1)
-      end
-
-    MapSet.new(from_beams ++ from_sources ++ aliases)
   end
 
   # -------------------------------------------------------------------
@@ -317,53 +253,148 @@ defmodule UsageRules.Validator do
   defp normalize_file(path) when is_binary(path), do: %{path: path, content: File.read!(path)}
 
   defp validate_file(%{path: path, content: content}, context) do
-    references = extract_references(path, content)
+    # ex_doc autolinks inline code spans but deliberately skips fenced code
+    # blocks, and earmark does not carry line info for fences. So fences are
+    # extracted with a line-accurate scan (and blanked out of the markdown
+    # before parsing), while spans are extracted with ex_doc's markdown
+    # pipeline. Both feed the same ex_doc resolution step.
+    {fences, blanked} = split_fences(content)
+    base_config = ex_doc_config(context, path)
+
+    candidates =
+      Enum.flat_map(fences, &fence_candidates/1) ++ span_candidates(blanked)
+
+    {ref_violations, refs_checked} =
+      Enum.flat_map_reduce(candidates, 0, fn candidate, count ->
+        {attempt_candidate(candidate, base_config), count + 1}
+      end)
+
+    {link_violations, links_checked} = validate_links(path, blanked, context)
 
     violations =
-      references
-      |> Enum.flat_map(&validate_reference(&1, context))
+      (ref_violations ++ link_violations)
       |> Enum.uniq_by(&{&1.line, &1.type, &1.reference})
-      |> Enum.sort_by(& &1.line)
+      |> Enum.sort_by(&{&1.line, &1.reference})
 
     %{
       path: path,
       violations: violations,
-      references_checked: length(references)
+      references_checked: refs_checked + links_checked
     }
   end
 
   # -------------------------------------------------------------------
-  # Reference extraction
+  # ex_doc delegation
   # -------------------------------------------------------------------
 
-  defp extract_references(path, content) do
-    content
-    |> String.split("\n")
-    |> Enum.with_index(1)
-    |> Enum.map_reduce(%{fence: nil}, fn {line, line_no}, state ->
-      {refs, state} = scan_line(line, line_no, state)
-      {Enum.map(refs, &Map.put(&1, :file, path)), state}
+  defp ex_doc_config(context, path) do
+    # Built with struct/2 (not struct syntax) so this module still compiles
+    # in projects that do not have ex_doc compiled.
+    struct(ExDoc.Autolink,
+      warnings: :send,
+      language: ExDoc.Language.Elixir,
+      file: path,
+      apps: Map.get(context, :apps, []),
+      deps: [],
+      extras: %{},
+      filtered_modules: [],
+      skip_undefined_reference_warnings_on: fn _ -> false end,
+      skip_code_autolink_to: fn _ -> false end
+    )
+  end
+
+  # Runs a single candidate through ex_doc's autolinker in strict mode:
+  # refs that resolve return a URL, refs that parse but do not resolve make
+  # ex_doc send its own warning messages to this process.
+  defp attempt_candidate(%{ref: ref, display: display, line: line}, base_config) do
+    config = %{base_config | line: line}
+    result = ExDoc.Autolink.url(ref, :custom_link, config)
+    messages = drain_warnings()
+
+    case {result, messages} do
+      {_url, []} ->
+        []
+
+      {_, messages} ->
+        Enum.map(messages, fn message ->
+          %{
+            file: base_config.file,
+            line: line,
+            type: kind_for(ref),
+            severity: "error",
+            reference: display,
+            message: message
+          }
+        end)
+    end
+  end
+
+  defp drain_warnings do
+    Stream.repeatedly(fn ->
+      receive do
+        {:warn, message, _meta} -> message
+      after
+        0 -> :empty
+      end
     end)
-    |> elem(0)
-    |> List.flatten()
+    |> Enum.take_while(&(&1 != :empty))
   end
 
-  defp scan_line(line, line_no, %{fence: nil} = state) do
-    case Regex.run(@fence_regex, line) do
-      [_line, marker, info] ->
-        {[], %{fence: {marker, fence_lang(info)}}}
-
-      nil ->
-        {inline_references(line, line_no), state}
-    end
+  defp markdown_processor_available? do
+    ExDoc.Markdown.Earmark.available?()
+  rescue
+    _ -> false
   end
 
-  defp scan_line(line, line_no, %{fence: {marker, lang}} = state) do
-    if fence_close?(line, marker) do
-      {[], %{state | fence: nil}}
-    else
-      {fenced_references(lang, line, line_no), state}
-    end
+  # -------------------------------------------------------------------
+  # Candidate extraction
+  # -------------------------------------------------------------------
+
+  # Returns `{fences, blanked_content}` where fences is a list of
+  # `%{lang: lang, lines: [{line_no, line}]}` and blanked_content is the
+  # markdown with every fence (markers included) replaced by blank lines so
+  # the markdown parser never sees fenced content.
+  defp split_fences(content) do
+    initial = %{marker: nil, lang: nil, lines: [], fences: []}
+
+    {blanked_lines, final} =
+      content
+      |> String.split("\n")
+      |> Enum.with_index(1)
+      |> Enum.map_reduce(initial, fn
+        {line, _line_no}, %{marker: nil} = state ->
+          case Regex.run(@fence_regex, line) do
+            [_line, marker, info] ->
+              {"", %{state | marker: marker, lang: fence_lang(info)}}
+
+            nil ->
+              {line, state}
+          end
+
+        {line, line_no}, %{marker: marker} = state ->
+          if fence_close?(line, marker) do
+            fence = %{lang: state.lang, lines: state.lines}
+            {"", %{state | marker: nil, lang: nil, lines: [], fences: [fence | state.fences]}}
+          else
+            {"", %{state | lines: [{line_no, line} | state.lines]}}
+          end
+      end)
+
+    # An unclosed fence consumes everything up to the end of the file.
+    open_fence =
+      if final.marker do
+        [%{lang: final.lang, lines: final.lines}]
+      else
+        []
+      end
+
+    fences =
+      final.fences
+      |> Enum.concat(open_fence)
+      |> Enum.reverse()
+      |> Enum.map(fn fence -> Map.update!(fence, :lines, &Enum.reverse/1) end)
+
+    {fences, Enum.join(blanked_lines, "\n")}
   end
 
   defp fence_lang(info) do
@@ -383,71 +414,161 @@ defmodule UsageRules.Validator do
     end
   end
 
-  defp inline_references(line, line_no) do
-    link_refs =
-      line
-      |> link_targets()
-      |> Enum.map(fn target ->
-        %{kind: :link, target: target, display: target, line: line_no}
-      end)
-
-    span_refs =
-      Regex.scan(@inline_span_regex, line, capture: :all_but_first)
-      |> Enum.flat_map(fn [span] -> span_references(span, line_no) end)
-
-    Enum.uniq_by(link_refs ++ span_refs, &{&1.kind, &1.display})
-  end
-
-  defp span_references(span, line_no) do
-    mix_refs =
-      @mix_task_regex
-      |> Regex.scan(span, capture: :all_but_first)
-      |> Enum.map(fn [task] ->
-        %{kind: :mix_task, task: task, display: "mix #{task}", line: line_no}
-      end)
-
-    module_refs =
-      span
-      |> strip_noise()
-      |> candidate_tokens()
-      |> Enum.map(fn token ->
-        token
-        |> parse_candidate()
-        |> case do
-          nil -> nil
-          ref -> Map.merge(ref, %{display: token, line: line_no})
-        end
-      end)
-      |> Enum.filter(& &1)
-
-    Enum.uniq_by(mix_refs ++ module_refs, &{&1.kind, &1.display})
-  end
-
-  defp fenced_references(lang, line, line_no) do
+  defp fence_candidates(%{lang: lang, lines: lines}) do
     cond do
       MapSet.member?(@elixir_langs, lang) ->
-        line
-        |> strip_noise()
-        |> candidate_tokens()
-        |> Enum.flat_map(fn token ->
-          case parse_candidate(token) do
-            nil -> []
-            ref -> [Map.merge(ref, %{display: token, line: line_no})]
-          end
+        Enum.flat_map(lines, fn {line_no, line} ->
+          line
+          |> strip_noise()
+          |> candidate_tokens()
+          |> Enum.flat_map(&candidates_for_token(&1, line_no))
         end)
-        |> Enum.uniq_by(&{&1.kind, &1.display})
 
       MapSet.member?(@shell_langs, lang) ->
-        @mix_task_regex
-        |> Regex.scan(line, capture: :all_but_first)
-        |> Enum.map(fn [task] ->
-          %{kind: :mix_task, task: task, display: "mix #{task}", line: line_no}
+        Enum.flat_map(lines, fn {line_no, line} ->
+          @mix_task_regex
+          |> Regex.scan(line, capture: :all_but_first)
+          |> Enum.map(fn [task] -> mix_candidate(task, line_no) end)
         end)
-        |> Enum.uniq_by(& &1.display)
 
       true ->
         []
     end
+  end
+
+  # Inline code spans, extracted with ex_doc's markdown pipeline so span
+  # detection matches what a docs build would autolink.
+  defp span_candidates(markdown) do
+    markdown
+    |> ExDoc.Markdown.to_ast(markdown_processor: ExDoc.Markdown.Earmark)
+    |> collect_code_spans([])
+    |> Enum.flat_map(fn {span, line} -> candidates_for_span(span, line) end)
+  end
+
+  defp collect_code_spans({:code, _attrs, [span], meta}, acc) when is_binary(span) do
+    [{span, meta[:line] || 1} | acc]
+  end
+
+  defp collect_code_spans(list, acc) when is_list(list) do
+    Enum.reduce(list, acc, &collect_code_spans/2)
+  end
+
+  defp collect_code_spans({_tag, _attrs, children, _meta}, acc) do
+    Enum.reduce(List.wrap(children), acc, &collect_code_spans/2)
+  end
+
+  defp collect_code_spans(_other, acc), do: acc
+
+  defp candidates_for_span(span, line) do
+    span = String.trim(span)
+
+    cond do
+      span == "" ->
+        []
+
+      # A span naming a mix task may carry arguments or flags; only the task
+      # name itself is a verifiable reference.
+      String.starts_with?(span, "mix ") ->
+        case Regex.run(@mix_task_regex, span, capture: :all_but_first) do
+          [task] -> [mix_candidate(task, line)]
+          _ -> []
+        end
+
+      skipped_candidate?(span) ->
+        []
+
+      true ->
+        [%{ref: span, display: span, line: line}]
+    end
+  end
+
+  defp mix_candidate(task, line_no) do
+    display = "mix " <> task
+    %{ref: display, display: display, line: line_no}
+  end
+
+  defp candidates_for_token(token, line_no) do
+    if skipped_candidate?(token) do
+      []
+    else
+      [%{ref: token, display: token, line: line_no}]
+    end
+  end
+
+  # Skips candidates that are common in prose and code but are not
+  # documentation references:
+  #
+  #   * bare `:atoms` (without `/arity`) — usually atom literals
+  #   * all-caps document basenames like `README` or `SKILL`
+  #   * single segments that are not module names — `foo`, `foo/1`,
+  #     `handle_call/3` (ex_doc would resolve those as *local* function
+  #     references, which is meaningless outside of module docs)
+  defp skipped_candidate?(":" <> rest), do: not String.contains?(rest, "/")
+
+  defp skipped_candidate?(token) do
+    cond do
+      MapSet.member?(@doc_file_names, token) ->
+        true
+
+      match?([_], String.split(token, ".")) ->
+        not Regex.match?(@module_like_regex, String.split(token, "/") |> hd())
+
+      true ->
+        false
+    end
+  end
+
+  defp strip_noise(text) do
+    text
+    |> String.replace(@url_regex, " ")
+    |> String.replace(@double_quoted_regex, " ")
+    |> String.replace(@comment_regex, " ")
+  end
+
+  defp candidate_tokens(text) do
+    Regex.scan(@candidate_regex, text, capture: :first)
+    |> Enum.map(fn [token] -> token end)
+  end
+
+  # -------------------------------------------------------------------
+  # Link validation
+  # -------------------------------------------------------------------
+
+  defp validate_links(path, blanked, context) do
+    {targets, links_checked} =
+      blanked
+      |> String.split("\n")
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {line, line_no} ->
+        line
+        |> link_targets()
+        |> Enum.map(&{line_no, &1})
+      end)
+      |> Enum.uniq()
+      |> then(&{&1, length(&1)})
+
+    violations =
+      Enum.flat_map(targets, fn {line_no, target} ->
+        dir = path |> Path.expand(context.cwd) |> Path.dirname()
+        resolved = Path.expand(strip_anchor(target), dir)
+
+        if File.exists?(resolved) do
+          []
+        else
+          [
+            %{
+              file: path,
+              line: line_no,
+              type: :link,
+              severity: "error",
+              reference: target,
+              message: "link target does not exist"
+            }
+          ]
+        end
+      end)
+
+    {violations, links_checked}
   end
 
   defp link_targets(line) do
@@ -469,262 +590,17 @@ defmodule UsageRules.Validator do
     target |> String.split("#") |> hd()
   end
 
-  defp strip_noise(text) do
-    text
-    |> String.replace(@url_regex, " ")
-    |> String.replace(@double_quoted_regex, " ")
-    |> String.replace(@comment_regex, " ")
-  end
-
-  defp candidate_tokens(text) do
-    Regex.scan(@candidate_regex, text, capture: :first)
-    |> Enum.map(fn [token] -> token end)
-  end
-
   # -------------------------------------------------------------------
-  # Token parsing
+  # Reporting helpers
   # -------------------------------------------------------------------
 
-  defp parse_candidate(":" <> rest), do: parse_erlang_candidate(rest)
+  defp kind_for("mix " <> _), do: :mix_task
+  defp kind_for("c:" <> _), do: :callback
+  defp kind_for("t:" <> _), do: :type
+  defp kind_for("m:" <> _), do: :module
 
-  defp parse_candidate(token), do: parse_elixir_candidate(token)
-
-  defp parse_erlang_candidate(rest) do
-    {base, arity} = split_arity(rest)
-
-    case String.split(base, ".") do
-      [module, function] ->
-        %{kind: :erlang_function, module: module, function: function, arity: arity}
-
-      _ ->
-        # A bare `:atom` is an atom literal far more often than an erlang
-        # module reference, so it is not validated.
-        nil
-    end
-  end
-
-  defp parse_elixir_candidate(token) do
-    {base, arity} = split_arity(token)
-    base = String.replace_prefix(base, "Elixir.", "")
-    segments = String.split(base, ".")
-
-    case segments do
-      [single] ->
-        if arity == nil and capitalized?(single) and not modified?(single) do
-          module_ref(single)
-        else
-          nil
-        end
-
-      _ ->
-        {module_segments, [last]} = Enum.split(segments, -1)
-        module = Enum.join(module_segments, ".")
-
-        cond do
-          capitalized_all?(module_segments) and lowercase_start?(last) and
-              not file_name_candidate?(module, last) ->
-            %{kind: :elixir_function, module: module, function: last, arity: arity}
-
-          capitalized_all?(segments) and arity == nil and not modified?(last) ->
-            module_ref(Enum.join(segments, "."))
-
-          true ->
-            nil
-        end
-    end
-  end
-
-  defp module_ref(name) do
-    if MapSet.member?(@doc_file_names, name) do
-      nil
-    else
-      %{kind: :elixir_module, module: name, function: nil, arity: nil}
-    end
-  end
-
-  defp split_arity(token) do
-    case String.split(token, "/", parts: 2) do
-      [base] ->
-        {base, nil}
-
-      [base, arity] ->
-        case Integer.parse(arity) do
-          {int, ""} -> {base, int}
-          _ -> {token, nil}
-        end
-    end
-  end
-
-  defp capitalized?(segment), do: Regex.match?(~r/^[A-Z]/, segment)
-  defp lowercase_start?(segment), do: Regex.match?(~r/^[a-z_]/, segment)
-
-  defp capitalized_all?(segments), do: segments != [] and Enum.all?(segments, &capitalized?/1)
-
-  defp modified?(segment), do: String.ends_with?(segment, ["!", "?"])
-
-  defp file_name_candidate?(module, function) do
-    MapSet.member?(@doc_file_names, module) and file_extension?(function)
-  end
-
-  defp file_extension?(segment) do
-    core =
-      segment
-      |> String.trim_trailing("!")
-      |> String.trim_trailing("?")
-
-    MapSet.member?(@file_extensions, String.downcase(core))
-  end
-
-  # -------------------------------------------------------------------
-  # Reference validation
-  # -------------------------------------------------------------------
-
-  defp validate_reference(%{kind: :elixir_module, module: module} = ref, context) do
-    if module_exists?(module, context) do
-      []
-    else
-      [violation(ref, "error", :module, "module not found in project or dependencies")]
-    end
-  end
-
-  defp validate_reference(%{kind: :elixir_function} = ref, context) do
-    %{module: module, function: function, arity: arity} = ref
-
-    if module_exists?(module, context) do
-      case Code.ensure_loaded(elixir_module(module)) do
-        {:module, mod} ->
-          check_function(ref, mod, function, arity, true, true)
-
-        {:error, _} ->
-          [
-            violation(
-              ref,
-              "warning",
-              :function,
-              "module is not compiled; cannot verify function"
-            )
-          ]
-      end
-    else
-      [violation(ref, "error", :module, "module not found in project or dependencies")]
-    end
-  end
-
-  defp validate_reference(%{kind: :erlang_function, module: module} = ref, context) do
-    %{function: function, arity: arity} = ref
-
-    if module_exists?(module, context) do
-      case Code.ensure_loaded(String.to_atom(module)) do
-        {:module, mod} ->
-          check_function(ref, mod, function, arity, false, false)
-
-        {:error, _} ->
-          [
-            violation(
-              ref,
-              "warning",
-              :function,
-              "module is not compiled; cannot verify function"
-            )
-          ]
-      end
-    else
-      [violation(ref, "error", :module, "module :#{module} not found")]
-    end
-  end
-
-  defp validate_reference(%{kind: :mix_task, task: task} = ref, context) do
-    if MapSet.member?(context.mix_task_names, task) do
-      []
-    else
-      [violation(ref, "error", :mix_task, "mix task not found in project or dependencies")]
-    end
-  end
-
-  defp validate_reference(%{kind: :link} = ref, context) do
-    target = strip_anchor(ref.target)
-    dir = ref.file |> Path.expand(context.cwd) |> Path.dirname()
-    resolved = Path.expand(target, dir)
-
-    if File.exists?(resolved) do
-      []
-    else
-      [violation(ref, "error", :link, "link target does not exist")]
-    end
-  end
-
-  defp elixir_module(name), do: String.to_atom("Elixir." <> name)
-
-  defp check_function(ref, mod, function, arity, include_macros?, include_callbacks?) do
-    arities =
-      module_entries(mod, include_macros?, include_callbacks?)
-      |> Enum.filter(fn {name, _arity} -> Atom.to_string(name) == function end)
-      |> Enum.map(&elem(&1, 1))
-      |> Enum.uniq()
-
-    cond do
-      arity != nil and arity in arities ->
-        []
-
-      arity == nil and arities != [] ->
-        []
-
-      arities != [] ->
-        sorted = arities |> Enum.sort() |> Enum.map_join(", ", &Integer.to_string/1)
-
-        [
-          violation(
-            ref,
-            "error",
-            :function,
-            "function is not defined with arity #{arity} (available arities: #{sorted})"
-          )
-        ]
-
-      true ->
-        [violation(ref, "error", :function, "function is not defined in this module")]
-    end
-  end
-
-  defp module_entries(mod, include_macros?, include_callbacks?) do
-    exports = List.wrap(mod.module_info(:exports))
-
-    macros =
-      if include_macros? and function_exported?(mod, :__info__, 1) do
-        List.wrap(mod.__info__(:macros))
-      else
-        []
-      end
-
-    callbacks =
-      if include_callbacks? do
-        # Raises UndefinedFunctionError for modules that are not behaviours.
-        try do
-          List.wrap(mod.behaviour_info(:callbacks))
-        rescue
-          _ -> []
-        end
-      else
-        []
-      end
-
-    exports ++ macros ++ callbacks
-  end
-
-  defp module_exists?(module, context) do
-    MapSet.member?(context.beam_module_names, module) or
-      MapSet.member?(context.source_module_names, module)
-  end
-
-  defp violation(ref, severity, type, message) do
-    %{
-      file: ref.file,
-      line: ref.line,
-      type: type,
-      severity: severity,
-      reference: ref.display,
-      message: message
-    }
+  defp kind_for(token) do
+    if String.contains?(token, "/"), do: :function, else: :module
   end
 
   defp count_violations(file_reports, severity) do
