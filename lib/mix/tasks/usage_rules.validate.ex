@@ -9,22 +9,15 @@ defmodule Mix.Tasks.UsageRules.Validate do
 
   @moduledoc """
   Validates module, function, mix task, and file references found in the
-  files generated and managed by `mix usage_rules.sync`.
-
-  References are parsed and resolved with `ex_doc` — the same engine that
-  autolinks references (and warns about broken ones) when generating HexDocs
-  documentation. Checks that `Module`, `Module.function/arity`, `m:Module`,
-  `c:Mod.callback/arity`, `t:Mod.type/arity`, and `:erlang.module/arity`
-  references resolve against your project and its dependencies the same way
-  a docs build resolves them (only *documented* API validates), that
-  `mix task.name` references are real tasks, and that relative markdown
-  links point at files that exist.
+  files generated and managed by `mix usage_rules.sync`, using ex_doc's own
+  autolink pipeline. Warnings are ex_doc's own, printed with file/line
+  information — the same warnings a HexDocs build would emit over the same
+  content. See `UsageRules.Validator` for exactly what is and is not
+  checked.
 
   ex_doc must be compiled and available. It is already a dev dependency of
   most Hex packages; when it is missing, the task fails with an actionable
   error telling you how to add it.
-
-  ## Scope
 
   By default, only rules-managed files are validated:
 
@@ -33,36 +26,24 @@ defmodule Mix.Tasks.UsageRules.Validate do
     * `*.md` files under skills managed by usage-rules (skills whose
       `SKILL.md` contains `managed-by: usage-rules`)
 
-  Use `--all` to validate every markdown file in the project instead
-  (excluding `deps/`, `_build/`, `doc/`, and hidden directories).
+  Explicit file paths can also be given to validate those instead.
 
   ## Examples
 
       $ mix usage_rules.validate
-      $ mix usage_rules.validate --strict
-      $ mix usage_rules.validate --all
-      $ mix usage_rules.validate --format json
-
-  ## Options
-
-    * `--format` - `human` (default) or `json`
-    * `--strict` - treat warnings as failures
-    * `--all` - validate all markdown files in the project, not just
-      rules-managed files
-    * `--help` - show this usage information
+      $ mix usage_rules.validate AGENTS.md usage-rules.md
 
   ## Exit status
 
-  Exits with a nonzero status when unresolvable references are found, making
-  the task suitable for CI. With `--strict`, warnings also cause a nonzero
-  exit.
+  Exits with a nonzero status when ex_doc emits any warning, making the task
+  suitable for CI.
   """
 
-  @switches [format: :string, strict: :boolean, all: :boolean, help: :boolean]
+  @switches [help: :boolean]
 
   @impl Mix.Task
   def run(argv) do
-    {opts, _remaining, invalid} = OptionParser.parse(argv, strict: @switches)
+    {opts, files, invalid} = OptionParser.parse(argv, strict: @switches)
 
     if invalid != [] do
       Mix.raise("Invalid options: #{inspect(invalid)}\n\n#{usage()}")
@@ -71,39 +52,32 @@ defmodule Mix.Tasks.UsageRules.Validate do
     if opts[:help] do
       Mix.shell().info(usage())
     else
-      validate(opts)
+      validate(files)
     end
   end
 
-  defp validate(opts) do
+  defp validate(files) do
     unless Mix.Project.get() do
       Mix.raise("mix usage_rules.validate must be run inside a Mix project")
     end
 
-    format = normalize_format(opts[:format])
-
     files =
-      if opts[:all] do
-        UsageRules.Validator.all_project_files()
-      else
-        managed_files()
+      case files do
+        [] -> managed_files()
+        files -> files
       end
 
     if files == [] do
-      Mix.shell().info(no_files_message(opts[:all]))
+      Mix.shell().info(no_files_message())
     else
-      context = UsageRules.Validator.context_from_mix()
-      report = UsageRules.Validator.validate(files, context)
+      result = UsageRules.Validator.validate(files)
 
-      output =
-        case format do
-          "json" -> UsageRules.Validator.json_report(report) |> Jason.encode!()
-          _human -> UsageRules.Validator.format_report(report)
-        end
+      Mix.shell().info(
+        "Validated #{length(result.files)} file(s) with ex_doc; " <>
+          if(result.warned?, do: "warnings were emitted.", else: "no warnings.")
+      )
 
-      Mix.shell().info(output)
-
-      if UsageRules.Validator.failed?(report, strict?: !!opts[:strict]) do
+      if result.warned? do
         exit({:shutdown, 1})
       end
     end
@@ -135,39 +109,23 @@ defmodule Mix.Tasks.UsageRules.Validate do
     |> Enum.sort()
   end
 
-  defp normalize_format(nil), do: "human"
+  defp no_files_message do
+    """
+    No usage-rules-managed files found to validate.
 
-  defp normalize_format(format) when format in ~w(human json), do: format
-
-  defp normalize_format(other) do
-    Mix.raise(~s"""
-    Invalid --format #{inspect(other)}. Expected "human" or "json".
-
-    #{usage()}
-    """)
-  end
-
-  defp no_files_message(all?) do
-    if all? do
-      "No markdown files found to validate."
-    else
-      """
-      No usage-rules-managed files found to validate.
-
-      Add a :usage_rules config to your mix.exs and run `mix usage_rules.sync`,
-      or pass --all to validate every markdown file in the project.
-      """
-      |> String.trim_trailing()
-    end
+    Add a :usage_rules config to your mix.exs and run `mix usage_rules.sync`,
+    or pass file paths to validate.
+    """
+    |> String.trim_trailing()
   end
 
   defp usage do
     """
-    mix usage_rules.validate [--format human|json] [--strict] [--all]
+    mix usage_rules.validate [files...]
 
     Validates module, function, mix task, and file references in
-    usage-rules-managed files (or all markdown files with --all).
-    Exits nonzero when unresolvable references are found.
+    usage-rules-managed files (or the given files) with ex_doc's own
+    autolink pipeline. Exits nonzero when ex_doc emits any warning.
     """
   end
 end
