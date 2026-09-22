@@ -99,7 +99,7 @@ defmodule Mix.Tasks.UsageRules.Validate do
     location = Keyword.get(skills_config, :location, ".claude/skills")
 
     Path.wildcard(Path.join(location, "*/SKILL.md"))
-    |> Enum.filter(&(File.read!(&1) =~ "managed-by: usage-rules"))
+    |> Enum.filter(&String.contains?(File.read!(&1), "managed-by: usage-rules"))
     |> Enum.flat_map(fn skill_md ->
       skill_md
       |> Path.dirname()
