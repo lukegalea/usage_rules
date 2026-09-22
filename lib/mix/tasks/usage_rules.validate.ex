@@ -8,7 +8,7 @@ defmodule Mix.Tasks.UsageRules.Validate do
   @shortdoc "Validates references in usage-rules-managed files"
 
   @moduledoc """
-  Validates module, function, mix task, and file references found in the
+  Validates module, function, and file references found in the
   files generated and managed by `mix usage_rules.sync`, using ex_doc's own
   autolink pipeline. Warnings are ex_doc's own, printed with file/line
   information — the same warnings a HexDocs build would emit over the same
@@ -123,7 +123,7 @@ defmodule Mix.Tasks.UsageRules.Validate do
     """
     mix usage_rules.validate [files...]
 
-    Validates module, function, mix task, and file references in
+    Validates module, function, and file references in
     usage-rules-managed files (or the given files) with ex_doc's own
     autolink pipeline. Exits nonzero when ex_doc emits any warning.
     """

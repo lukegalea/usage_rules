@@ -380,7 +380,7 @@ mix usage_rules.search_docs "search term" --page 2 --per-page 20
 
 ## Reference Validation
 
-`mix usage_rules.validate` checks the files managed by `mix usage_rules.sync` for broken references by driving `ex_doc`'s own autolink pipeline over them. Each file is validated exactly like an extra page in a docs build, and the warnings are `ex_doc`'s own, printed with file/line information — the same warnings a HexDocs build would emit over the same content. Function references (`Module.function/arity`, `:erlang.function/arity`), explicit reference links, relative file links, and `mix task` mentions in code spans are verified against your project, its dependencies, and Erlang/OTP the same way a docs build resolves them (only *documented* API validates). ex_doc must be compiled (it is already a dev dependency of most Hex packages); the task fails with an actionable error when it is not. Exit status is nonzero when any warning is emitted, so it can be used in CI.
+`mix usage_rules.validate` checks the files managed by `mix usage_rules.sync` for broken references by driving `ex_doc`'s own autolink pipeline over them. Each file is validated exactly like an extra page in a docs build, and the warnings are `ex_doc`'s own, printed with file/line information — the same warnings a HexDocs build would emit over the same content. Function references (`Module.function/arity`, `:erlang.function/arity`), explicit reference links, and relative file links are verified against your project, its dependencies, and Erlang/OTP the same way a docs build resolves them (only *documented* API validates). ex_doc must be compiled (it is already a dev dependency of most Hex packages); the task fails with an actionable error when it is not. Exit status is nonzero when any warning is emitted, so it can be used in CI.
 
 ```sh
 # Validate rules-managed files (the composed file and managed skills)
@@ -392,7 +392,28 @@ mix usage_rules.validate usage-rules.md
 
 By default, only rules-managed files are validated: the composed file from the `:file` config option, and `*.md` files under skills whose `SKILL.md` contains `managed-by: usage-rules`.
 
-Note that `ex_doc` deliberately skips fenced code blocks when autolinking, so fenced content is not checked. Two scoped complements cover what docs builds stay silent about: `mix task` mentions and bare dotted module mentions (`NoSuch.Module.Here`) in code spans are checked with ex_doc's own resolution, using ex_doc's warning text.
+The check is deliberately conservative: the warnings are exactly what a docs build emits, so `ex_doc` skips fenced code blocks, and stays silent about plain code span mentions that never resolve — such as `mix task` names and bare undefined module names — just like it does inside moduledocs.
+
+### Zero-dependency alternative: validate as docs extras
+
+Since the files are validated exactly like documentation, you can get the same warnings from ex_doc alone, with no usage-rules involved: route them through the normal docs `extras` pipeline, the pattern endorsed in [elixir-lang/ex_doc#2272](https://github.com/elixir-lang/ex_doc/issues/2272). In your library's `mix.exs`, gate an `extras` entry on an environment variable:
+
+```elixir
+defp docs do
+  [
+    extras: [
+      {"README.md", title: "Home"},
+      "CHANGELOG.md"
+    ] ++ extra_docs()
+  ]
+end
+
+defp extra_docs do
+  if glob = System.get_env("EXTRA_DOCS"), do: Path.wildcard(glob), else: []
+end
+```
+
+Then run `EXTRA_DOCS=1 mix docs`, passing a glob matching the files you want checked (e.g. `EXTRA_DOCS="{AGENTS.md,usage-rules/*.md}"`). Adding `warnings_as_errors: true` to the docs config makes it CI-friendly.
 
 ## For Package Authors
 

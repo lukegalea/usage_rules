@@ -8,10 +8,10 @@ defmodule UsageRules.Validator do
   by driving ex_doc's own autolink pipeline over them.
 
   This is the engine behind `mix usage_rules.validate`. Each file is parsed
-  and autolinked exactly like an extra page in a docs build
-  (`ExDoc.Extras.build/2` + `ExDoc.Formatter.autolink/5`), and the warnings
-  are ex_doc's own, printed with file/line information — the same warnings
-  you would get from a HexDocs build over the same content.
+  and autolinked exactly like an extra page in a docs build — through ex_doc's
+  extras builder and its formatter autolink pass — and the warnings are
+  ex_doc's own, printed with file/line information: the same warnings you
+  would get from a HexDocs build over the same content.
 
   ## What ex_doc checks
 
@@ -27,15 +27,11 @@ defmodule UsageRules.Validator do
 
   ## What ex_doc does not check
 
-  ex_doc deliberately skips fenced code blocks when autolinking, and in
-  regular docs builds it stays silent about `mix task` mentions in plain
-  code spans and about bare module mentions that do not exist at all. The
-  same applies here, with two scoped complements: `validate/1` additionally
-  checks `mix task.name` mentions in inline code spans (e.g.
-  `` `mix usage_rules.sync --yes` ``) and bare dotted module mentions (e.g.
-  `` `NoSuch.Module.Here` ``) using ex_doc's own resolution, reporting
-  unknown targets with ex_doc's warning text. Valid, hidden, and
-  single-segment module mentions are left to ex_doc's native behavior.
+  ex_doc deliberately skips fenced code blocks when autolinking, and it
+  stays silent about plain code span mentions that never resolve, such as
+  `mix task` names and bare undefined module names — the same silence you
+  get inside moduledocs. Validation warnings are exactly a docs build's
+  warnings, nothing more and nothing less.
 
   ex_doc must be compiled and available. When it is not, validation fails
   with an actionable error (see `ensure_ex_doc!/1`).
@@ -113,25 +109,16 @@ defmodule UsageRules.Validator do
     # ex_doc's autolink phase.
     @warned_flag {ExDoc, :warned?}
 
-    @mix_task_regex ~r/^mix\s+([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*)/
-
     def validate(files) when is_list(files) do
       ensure_ex_doc!()
 
       :persistent_term.erase(@warned_flag)
 
-      # ExDoc structs are built with struct/2 (not struct expansion syntax) so
-      # this module still compiles in projects that do not have ex_doc
-      # compiled; validate/1 requires it only at runtime. The flag key is read
-      # and erased the same way ex_doc's own CLI decides the docs build exit
-      # status.
-      config = struct(ExDoc.Config, [])
-      extras = ExDoc.Extras.build(files, config)
+      # The flag key is read and erased the same way ex_doc's own CLI decides
+      # the docs build exit status.
+      extras = ExDoc.Extras.build(files, %ExDoc.Config{})
 
-      Enum.each(extras, &validate_span_complements/1)
-
-      formatter_config =
-        struct(ExDoc.Formatter.Config, apps: project_apps(), deps: [])
+      formatter_config = %ExDoc.Formatter.Config{apps: project_apps(), deps: []}
 
       ExDoc.Formatter.autolink(formatter_config, [], [], extras, extension: ".html")
 
@@ -139,115 +126,6 @@ defmodule UsageRules.Validator do
     end
 
     defp markdown_processor_available?, do: ExDoc.Markdown.Earmark.available?()
-
-    # -------------------------------------------------------------------
-    # complements: mix tasks and bare modules in code spans
-    # -------------------------------------------------------------------
-
-    # ex_doc's autolink phase is deliberately permissive in regular docs
-    # builds, so two reference kinds that usage-rules files rely on get no
-    # native warning: `mix task` mentions in plain code spans, and bare
-    # undefined module mentions (`NoSuch.Module.Here`). Both are scoped
-    # complements here: candidates are pushed through ex_doc's own resolution
-    # (`ExDoc.Autolink.url/3` in strict mode), warnings are collected via
-    # ex_doc's `warnings: :send` mode and re-emitted with `ExDoc.warn/2` so
-    # they print (and set the warned flag) exactly like native warnings.
-
-    # A bare module span is a dotted alias chain with only uppercase-first
-    # segments (`Foo.Bar`, `NoSuch.Module.Here`). Single segments (`Enum`),
-    # atoms (`:ok`), function refs (`Foo.bar/1`), and file names (`SKILL.md`)
-    # are not candidates.
-    @module_span_regex ~r/^[A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)+$/
-
-    defp validate_span_complements(%{__struct__: ExDoc.ExtraNode, doc: doc, source_path: path}) do
-      # Struct built with struct/2 for compile-time safety without ex_doc.
-      config =
-        struct(ExDoc.Autolink,
-          warnings: :send,
-          language: ExDoc.Language.Elixir,
-          file: path,
-          apps: project_apps(),
-          deps: []
-        )
-
-      walk_spans(doc, config)
-    end
-
-    defp validate_span_complements(_other), do: :ok
-
-    # Fenced code blocks are skipped, matching ex_doc's own autolinking.
-    defp walk_spans({:pre, _, _, _}, _config), do: :ok
-
-    # Links are validated natively by the autolink phase; don't double-report.
-    defp walk_spans({:a, _, _, _}, _config), do: :ok
-
-    defp walk_spans({:code, _, [code], meta}, config) do
-      code = String.trim(code)
-
-      cond do
-        task = mix_task_name(code) ->
-          check_span("mix " <> task, meta[:line], config)
-
-        Regex.match?(@module_span_regex, code) ->
-          check_bare_module_span(code, meta[:line], config)
-
-        true ->
-          :ok
-      end
-    end
-
-    defp walk_spans(list, config) when is_list(list) do
-      Enum.each(list, &walk_spans(&1, config))
-    end
-
-    defp walk_spans({_tag, _attrs, children, _meta}, config) do
-      walk_spans(List.wrap(children), config)
-    end
-
-    defp walk_spans(_other, _config), do: :ok
-
-    defp mix_task_name(code) do
-      case Regex.run(@mix_task_regex, code, capture: :all_but_first) do
-        [task] -> task
-        _ -> nil
-      end
-    end
-
-    defp check_bare_module_span(code, line, config) do
-      # Only warn where the native pass is silent: modules that do not exist
-      # at all. Valid, hidden, and limited modules are already handled (or
-      # accepted) by ex_doc's autolink phase.
-      case ExDoc.Language.Elixir.parse_module(code, :custom_link) do
-        {:module, module} ->
-          if ExDoc.Refs.get_visibility({:module, module}) == :undefined do
-            check_span(code, line, config)
-          end
-
-        :error ->
-          :ok
-      end
-    end
-
-    defp check_span(ref, line, config) do
-      config = %{config | line: line}
-      ExDoc.Autolink.url(ref, :custom_link, config)
-      Enum.each(drain_warnings(), &ExDoc.warn(&1, file: config.file, line: config.line))
-    end
-
-    defp drain_warnings do
-      Stream.repeatedly(fn ->
-        receive do
-          {:warn, message, _meta} -> message
-        after
-          0 -> :empty
-        end
-      end)
-      |> Enum.take_while(&(&1 != :empty))
-    end
-
-    # -------------------------------------------------------------------
-    # Project context
-    # -------------------------------------------------------------------
 
     defp project_apps do
       case Mix.Project.get() do

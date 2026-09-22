@@ -70,6 +70,9 @@ defmodule UsageRules.ValidatorTest do
       assert result.warned?
       assert warnings =~ "documentation references module \"Mix.Tasks.UsageRules.Sync.Docs\""
       assert warnings =~ "hidden"
+
+      # reported exactly once — the native pass, with no complements
+      assert warnings |> String.split("documentation references module") |> tl() |> length() == 1
     end
 
     test "warns about broken backtick reference links" do
@@ -125,10 +128,8 @@ defmodule UsageRules.ValidatorTest do
       refute result.warned?
       assert warnings == ""
     end
-  end
 
-  describe "bare module mentions in code spans" do
-    test "warns about undefined dotted modules using ex_doc's resolution and message" do
+    test "bare undefined module mentions in plain code spans stay silent, like in moduledocs" do
       {warnings, result, _tmp_dir} =
         validate!(%{
           "rules.md" => """
@@ -136,52 +137,11 @@ defmodule UsageRules.ValidatorTest do
           """
         })
 
-      assert result.warned?
-      assert warnings =~ "documentation references module \"NoSuch.Module.Xyz\""
-      assert warnings =~ "but it is undefined"
-      assert warnings =~ "rules.md:1"
-    end
-
-    test "does not warn about valid dotted modules" do
-      {warnings, result, _tmp_dir} =
-        validate!(%{
-          "rules.md" => """
-          See `String.Chars` and `Mix.Tasks.UsageRules.List` in prose.
-          """
-        })
-
       refute result.warned?
       assert warnings == ""
     end
 
-    test "reports hidden modules once (native pass, not the complement)" do
-      {warnings, result, _tmp_dir} =
-        validate!(%{
-          "rules.md" => """
-          Docs: `Mix.Tasks.UsageRules.Sync.Docs`
-          """
-        })
-
-      assert result.warned?
-      assert warnings =~ "documentation references module \"Mix.Tasks.UsageRules.Sync.Docs\""
-      assert warnings |> String.split("documentation references module") |> tl() |> length() == 1
-    end
-
-    test "ignores single segments, atoms, lowercase chains, and file names" do
-      {warnings, result, _tmp_dir} =
-        validate!(%{
-          "rules.md" => """
-          `Enum` and `:ok` and `foo.bar` and `SKILL.md` and `README`.
-          """
-        })
-
-      refute result.warned?
-      assert warnings == ""
-    end
-  end
-
-  describe "mix task mentions in code spans" do
-    test "warns about unknown mix tasks using ex_doc's resolution and message" do
+    test "mix task mentions in plain code spans stay silent, like in moduledocs" do
       {warnings, result, _tmp_dir} =
         validate!(%{
           "rules.md" => """
@@ -189,30 +149,15 @@ defmodule UsageRules.ValidatorTest do
           """
         })
 
-      assert result.warned?
-      assert warnings =~ "documentation references \"mix definitely_not_a_real_task\""
-      assert warnings =~ "rules.md:1"
-    end
-
-    test "accepts known tasks with flags and arguments" do
-      {warnings, result, _tmp_dir} =
-        validate!(%{
-          "rules.md" => """
-          Run `mix usage_rules.sync --yes` and `mix usage_rules.docs Enum.zip/1`.
-          """
-        })
-
       refute result.warned?
       assert warnings == ""
     end
 
-    test "checks task mentions inside fenced shell blocks are skipped like ex_doc does" do
+    test "single segments, atoms, lowercase chains, and file names are not module references" do
       {warnings, result, _tmp_dir} =
         validate!(%{
           "rules.md" => """
-          ```sh
-          mix definitely_not_a_real_task
-          ```
+          `Enum` and `:ok` and `foo.bar` and `SKILL.md` and `README`.
           """
         })
 
